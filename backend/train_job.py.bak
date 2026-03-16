@@ -1,0 +1,310 @@
+# backend/train_job.py
+"""
+train_job.run_training(params, broadcast_train, record_fn, stop_event, pause_event, state, model_out_dir="backend/models")
+- params: dict of hyperparams (model, epochs, batchSize, dataset, ...)
+- broadcast_train: callable(event_dict) -> used to send WS events to clients
+- record_fn: callable(event_dict) -> used to persist events (optional)
+- stop_event, pause_event: threading.Event objects
+- state: shared state dict (should be mutated with state['state']=..., state['msg']=...)
+- model_out_dir: where to save model (optional)
+"""
+
+from __future__ import annotations
+import os
+import time
+import traceback
+import logging
+import glob
+from typing import Any, Callable, Dict, Optional, Tuple
+
+log = logging.getLogger("can-ids.train_job")
+
+# Try importing packages used for real training
+try:
+    import numpy as np
+    import sklearn  # noqa: F401
+    from sklearn.model_selection import train_test_split
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import confusion_matrix, accuracy_score
+    SKLEARN_OK = True
+except Exception:
+    SKLEARN_OK = False
+
+# local dataset loader
+try:
+    from backend.dataset_loader import load_dataset
+except Exception:
+    try:
+        # fallback if run from repo root
+        from dataset_loader import load_dataset
+    except Exception:
+        load_dataset = None
+
+def _safe_broadcast(bcast: Optional[Callable[[Dict[str, Any]], None]], payload: Dict[str, Any]):
+    try:
+        if callable(bcast):
+            bcast(payload)
+    except Exception:
+        log.exception("broadcast failed")
+
+def _safe_record(record_fn: Optional[Callable[[Dict[str, Any]], None]], payload: Dict[str, Any]):
+    try:
+        if callable(record_fn):
+            record_fn(payload)
+    except Exception:
+        log.exception("record_fn failed")
+
+def _resolve_dataset_param(dataset_param: Optional[str]) -> Optional[str]:
+    """
+    Resolve dataset_param to an actual file path (if possible).
+    This version uses your project layout:
+      backend/data/ocs-lab/  <- preset folder with CSV files you showed
+      backend/datasets/      <- uploaded or preset single-file datasets
+    Strategy:
+      - If dataset_param is an existing path -> return it
+      - If dataset_param is a preset like 'ocs-lab' | 'ocs_lab' -> prefer known CSVs inside backend/data/ocs-lab
+      - Otherwise search backend/datasets and backend/data for matching files
+    """
+    if not dataset_param:
+        return None
+
+    ds = str(dataset_param).strip()
+
+    # If it's an absolute or relative filesystem path that exists, return it
+    if os.path.isabs(ds) and os.path.exists(ds):
+        return ds
+
+    # try relative to repo cwd
+    cand = os.path.normpath(os.path.join(os.getcwd(), ds))
+    if os.path.exists(cand):
+        return cand
+
+    # candidate base dirs
+    base_backend = os.path.join(os.getcwd(), "backend")
+    candidates = [
+        os.path.join(base_backend, "data"),
+        os.path.join(base_backend, "datasets"),
+        os.path.join(base_backend, "data", "ocs-lab"),
+    ]
+
+    # Normalize common preset names -> folder name "ocs-lab"
+    lowered = ds.lower()
+    if lowered in ("ocs-lab", "ocs_lab", "ocslab", "ocs-lab.csv", "ocs_lab.csv"):
+        folder = os.path.join(base_backend, "data", "ocs-lab")
+        if os.path.isdir(folder):
+            # prefer specific filenames you have in that folder
+            prefer = [
+                "DoS_attack_dataset.csv",
+                "DoS_attack_dataset.CSV",
+                "DoS_attack_dataset.csv",
+                "Fuzzy_attack_dataset.csv",
+                "Fuzzy_attack_dataset.CSV",
+                "Attack_free_dataset.csv",
+                "Impersonation_attack_dataset.csv",
+                "datasets.csv",
+            ]
+            for p in prefer:
+                pth = os.path.join(folder, p)
+                if os.path.exists(pth):
+                    return pth
+            # fallback: any csv in the folder
+            files = sorted(glob.glob(os.path.join(folder, "*.csv"))) + sorted(glob.glob(os.path.join(folder, "*.parquet")))
+            if files:
+                return files[0]
+        # if folder not found, continue to general search
+
+    # try searching backend/datasets for exact filename or substring
+    basename = os.path.basename(ds)
+    for base in candidates:
+        pth = os.path.join(base, basename)
+        if os.path.exists(pth):
+            return pth
+
+    # try substring matches in the candidate folders
+    for base in candidates:
+        if not os.path.isdir(base):
+            continue
+        matches = sorted(glob.glob(os.path.join(base, f"*{ds}*.csv"))) + sorted(glob.glob(os.path.join(base, f"*{ds}*.parquet")))
+        if matches:
+            return matches[0]
+
+    # nothing found
+    return None
+
+def run_training(params: Dict[str, Any],
+                 broadcast_train: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 record_fn: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 stop_event: Optional[Any] = None,
+                 pause_event: Optional[Any] = None,
+                 state: Optional[Dict[str, Any]] = None,
+                 model_out_dir: str = "backend/models"):
+    """
+    Start a training job. Tries to run real sklearn training when dataset & env are suitable,
+    otherwise falls back to a simulated training loop so the UI gets live events.
+    """
+    try:
+        state = state or {}
+        stop_event = stop_event or DummyEvent()
+        pause_event = pause_event or DummyEvent()
+
+        model_name = str(params.get("model", "RandomForest"))
+        epochs = int(params.get("epochs", 10) or 10)
+        batch_size = int(params.get("batchSize", 256) or 256)
+        train_split = float(params.get("trainSplit", 0.8) or 0.8)
+        dataset = params.get("dataset")  # may be file path or preset name
+        seed = int(params.get("seed", 42) or 42)
+
+        log.info("[train_job] start: model=%s epochs=%s batch=%s dataset=%s", model_name, epochs, batch_size, dataset)
+        state.update({"state": "training", "msg": "starting"})
+        _safe_broadcast(broadcast_train, {"type": "status", "state": "training", "msg": "starting"})
+
+        # attempt to load dataset if loader available
+        X, y, meta = None, None, {}
+        if load_dataset is not None:
+            resolved_path = None
+            try:
+                resolved_path = _resolve_dataset_param(dataset) if dataset else None
+            except Exception:
+                resolved_path = None
+
+            if resolved_path:
+                _safe_broadcast(broadcast_train, {"type": "log", "msg": f"Resolved dataset -> {resolved_path}"})
+                log.info("[train_job] resolved dataset -> %s", resolved_path)
+                try:
+                    X, y, meta = load_dataset(resolved_path)
+                    _safe_broadcast(broadcast_train, {"type": "log", "msg": f"Loaded dataset rows={len(X) if X is not None else 0}, features={X.shape[1] if X is not None else 'unknown'}"})
+                except Exception as e:
+                    log.exception("[train_job] dataset load failed for resolved path")
+                    _safe_broadcast(broadcast_train, {"type": "log", "msg": f"Dataset load failed: {e}"})
+                    X, y, meta = None, None, {}
+            else:
+                # last resort: let loader handle the given param (some loaders accept preset names)
+                try:
+                    _safe_broadcast(broadcast_train, {"type": "log", "msg": f"Attempting loader with dataset param '{dataset}' (no resolved path)."})
+                    X, y, meta = load_dataset(dataset) if dataset else (None, None, {})
+                    _safe_broadcast(broadcast_train, {"type": "log", "msg": f"Loaded dataset rows={len(X) if X is not None else 0}, features={X.shape[1] if X is not None else 'unknown'}"})
+                except Exception as e:
+                    log.exception("[train_job] dataset load failed (no resolved path)")
+                    _safe_broadcast(broadcast_train, {"type": "log", "msg": f"Dataset load failed: {e}"})
+                    X, y, meta = None, None, {}
+
+        # decide whether to run real training
+        try_real = SKLEARN_OK and X is not None and y is not None and len(y) >= 10 and len(set(y)) > 1
+
+        if try_real:
+            # real sklearn RandomForest training with epoch-style reporting
+            try:
+                _safe_broadcast(broadcast_train, {"type": "log", "msg": "Preparing real training (sklearn)."})
+                log.info("[train_job] using sklearn for training")
+
+                stratify_obj = (y if (y is not None and len(set(y)) > 1) else None)
+                X_train, X_val, y_train, y_val = train_test_split(
+                    X, y, train_size=train_split, random_state=seed, stratify=stratify_obj
+                )
+
+                clf = RandomForestClassifier(n_estimators=100, random_state=seed, n_jobs=-1)
+                rng = np.random.RandomState(seed)
+                n_samples = X_train.shape[0]
+
+                cm_list = [[0, 0], [0, 0]]
+                for ep in range(1, epochs + 1):
+                    if getattr(stop_event, "is_set", lambda: False)():
+                        _safe_broadcast(broadcast_train, {"type": "status", "state": "stopped", "msg": "stopped by user"})
+                        state.update({"state": "stopped", "msg": "stopped by user"})
+                        return
+
+                    while getattr(pause_event, "is_set", lambda: False)():
+                        _safe_broadcast(broadcast_train, {"type": "status", "state": "paused", "msg": "paused"})
+                        time.sleep(0.5)
+
+                    subset_size = max(1, min(n_samples, batch_size))
+                    idx = rng.choice(n_samples, size=subset_size, replace=False)
+                    try:
+                        clf.fit(X_train[idx], y_train[idx])
+                    except Exception:
+                        clf.fit(X_train, y_train)
+
+                    try:
+                        y_pred = clf.predict(X_val)
+                        acc = float(accuracy_score(y_val, y_pred))
+                        cm = confusion_matrix(y_val, y_pred)
+                        if cm is not None:
+                            if cm.shape == (2, 2):
+                                cm_list = cm.tolist()
+                            else:
+                                a = [[0, 0], [0, 0]]
+                                for i in range(min(2, cm.shape[0])):
+                                    for j in range(min(2, cm.shape[1])):
+                                        a[i][j] = int(cm[i, j])
+                                cm_list = a
+                    except Exception:
+                        acc = 0.0
+                        cm_list = [[0, 0], [0, 0]]
+
+                    pct = float(100.0 * ep / max(1, epochs))
+                    _safe_broadcast(broadcast_train, {"type": "metric", "epoch": ep, "loss": 0.0, "valLoss": 0.0, "accuracy": acc, "valAccuracy": acc})
+                    _safe_broadcast(broadcast_train, {"type": "progress", "progress": pct, "epoch": ep})
+                    _safe_record(record_fn, {"event": "metric", "epoch": ep, "accuracy": acc, "progress": pct})
+                    time.sleep(0.5)
+
+                os.makedirs(model_out_dir, exist_ok=True)
+                model_path = os.path.join(model_out_dir, f"{model_name}_model.pkl")
+                try:
+                    import joblib
+                    joblib.dump(clf, model_path)
+                    _safe_broadcast(broadcast_train, {"type": "log", "msg": f"Model saved to {model_path}"})
+                except Exception:
+                    _safe_broadcast(broadcast_train, {"type": "log", "msg": "Model save failed (joblib not available)"})
+
+                _safe_broadcast(broadcast_train, {"type": "confusion", "matrix": cm_list, "labels": ["neg", "pos"]})
+                state.update({"state": "completed", "msg": "training completed"})
+                _safe_broadcast(broadcast_train, {"type": "status", "state": "completed", "msg": "training completed"})
+                return
+
+            except Exception:
+                log.exception("[train_job] real training failed, falling back to simulated loop")
+
+        # Fallback simulated loop
+        _safe_broadcast(broadcast_train, {"type": "log", "msg": "Starting simulated training loop (debug fallback)."})
+        total_epochs = max(1, int(epochs))
+        for ep in range(1, total_epochs + 1):
+            if getattr(stop_event, "is_set", lambda: False)():
+                _safe_broadcast(broadcast_train, {"type": "status", "state": "stopped", "msg": "stopped by user"})
+                state.update({"state": "stopped", "msg": "stopped by user"})
+                return
+            while getattr(pause_event, "is_set", lambda: False)():
+                _safe_broadcast(broadcast_train, {"type": "status", "state": "paused", "msg": "paused"})
+                time.sleep(0.5)
+
+            loss = max(0.0, 1.0 - (ep / total_epochs) - (0.02 * (0.5 - (time.time() % 1))))
+            acc = min(1.0, 0.2 + (ep / total_epochs) * 0.8)
+            pct = float(100.0 * ep / max(1, total_epochs))
+            _safe_broadcast(broadcast_train, {"type": "metric", "epoch": ep, "loss": round(loss, 4), "valLoss": round(loss + 0.05, 4), "accuracy": round(acc, 4), "valAccuracy": round(acc - 0.02, 4)})
+            _safe_broadcast(broadcast_train, {"type": "progress", "progress": pct, "epoch": ep})
+            _safe_record(record_fn, {"event": "metric", "epoch": ep, "accuracy": acc, "progress": pct})
+            time.sleep(0.8)
+
+        cm_list = [[int(total_epochs * 2), int(total_epochs * 1)], [int(total_epochs * 1), int(total_epochs * 6)]]
+        _safe_broadcast(broadcast_train, {"type": "confusion", "matrix": cm_list, "labels": ["neg", "pos"]})
+        state.update({"state": "completed", "msg": "simulated training completed"})
+        _safe_broadcast(broadcast_train, {"type": "status", "state": "completed", "msg": "simulated training completed"})
+        return
+
+    except Exception as e:
+        log.exception("[train_job] exception")
+        _safe_broadcast(broadcast_train, {"type": "log", "msg": f"[train_job] exception: {e}"})
+        _safe_broadcast(broadcast_train, {"type": "status", "state": "error", "msg": str(e)})
+        state.update({"state": "error", "msg": str(e)})
+        return
+
+
+# small helper if events not provided
+class DummyEvent:
+    def __init__(self):
+        self._flag = False
+    def is_set(self):
+        return bool(self._flag)
+    def set(self):
+        self._flag = True
+    def clear(self):
+        self._flag = False

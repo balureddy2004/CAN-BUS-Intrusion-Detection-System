@@ -1,0 +1,56 @@
+# =========================
+# Python
+# =========================
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# =========================
+# Node / Frontend
+# =========================
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# =========================
+# Databases / Runtime
+# =========================
+ids.db
+ids.db-shm
+ids.db-wal
+*.sqlite
+*.sqlite3
+
+# =========================
+# Environment / Secrets
+# =========================
+.env
+*.env
+
+# =========================
+# Temp / Generated
+# =========================
+tmp_models/
+tmp/
+*.log
+
+# =========================
+# OS / Editor
+# =========================
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Replay / demo datasets
+backend/datasets/*.csv
+datasets/**/*.csv
+
+backend/data/
+backend/models/
+datasets/
+*.pkl
+*.csv
+.venv/
+__pycache__/

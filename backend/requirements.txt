@@ -1,0 +1,30 @@
+# ---- Core Server ----
+flask==3.0.3
+flask-cors==4.0.1
+flask-sock==0.5.0
+python-dotenv==1.0.1
+
+# ---- Concurrency / WebSockets ----
+gevent==22.10.2
+greenlet==2.0.2
+
+# ---- SocketIO (optional, used in your project) ----
+flask-socketio==5.3.6
+eventlet==0.36.1
+
+# ---- ML & Data (Python 3.10 compatible) ----
+numpy>=1.24.0,<2.0.0
+pandas>=2.1.0,<2.2.0
+scikit-learn>=1.2.2,<1.4.0
+joblib>=1.2.0
+
+# ---- Raspberry Pi CAN Support ----
+python-can>=4.3.0,<4.7.0   # stable on Windows + Pi
+# python-can-isotp removed (not available on Windows)
+
+# ---- Utilities ----
+python-multipart>=0.0.6
+python-dateutil>=2.8.2
+
+# ---- Testing ----
+pytest>=7.2.0

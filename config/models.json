@@ -1,0 +1,34 @@
+[
+  {
+    "id": "can_detector_v1",
+    "display": "Can Detector V1",
+    "enabled": true,
+    "requires_gpu": false,
+    "weights_path": "C:\\Code\\CAN_IDS_PROJECT\\models\\can_detector_v1\\weights.pth",
+    "notes": ""
+  },
+  {
+    "id": "lstm",
+    "display": "Lstm",
+    "enabled": true,
+    "requires_gpu": false,
+    "weights_path": "C:\\Code\\CAN_IDS_PROJECT\\models\\lstm\\weights.pth",
+    "notes": ""
+  },
+  {
+    "id": "random_forest",
+    "display": "Random Forest",
+    "enabled": true,
+    "requires_gpu": false,
+    "weights_path": "C:\\Code\\CAN_IDS_PROJECT\\models\\random_forest\\model.joblib",
+    "notes": ""
+  },
+  {
+    "id": "xgboost",
+    "display": "Xgboost",
+    "enabled": true,
+    "requires_gpu": false,
+    "weights_path": "C:\\Code\\CAN_IDS_PROJECT\\models\\xgboost\\model.xgb",
+    "notes": ""
+  }
+]

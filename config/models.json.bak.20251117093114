@@ -1,0 +1,10 @@
+﻿[
+  {
+    "id": "can_detector_v1",
+    "display": "Can Detector V1",
+    "enabled": true,
+    "requires_gpu": false,
+    "weights_path": "C:\\Code\\CAN_IDS_PROJECT\\models\\can_detector_v1\\weights.pth",
+    "notes": "dummy placeholder - replace with real weights when available"
+  }
+]
