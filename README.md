@@ -184,12 +184,3 @@ Potential areas for expansion include:
 * Streaming pipeline optimization
 * More advanced visualization and analytics
 * Integration with additional vehicle network protocols
-
----
-
-## Author
-
-Deekshith GR
-Computer Science Student – Cybersecurity Focus
-
-GitHub: https://github.com/Deekshith-GR
